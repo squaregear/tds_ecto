@@ -558,19 +558,9 @@ if Code.ensure_loaded?(Tds) do
     defp lock(lock_clause), do: " #{lock_clause} "
 
     defp boolean(_name, [], _sources, _query), do: []
-    defp boolean(name, [%{expr: expr, op: op} | query_exprs], sources, query) do
+    defp boolean(name, query_exprs, sources, query) do
       boolean_expression =
-        Enum.reduce(
-          query_exprs,
-          {op, paren_expr(expr, sources, query)},
-          fn
-            %{expr: expr, op: op}, {op, acc} ->
-              {op, acc <> operator_to_boolean(op) <> paren_expr(expr, sources, query)}
-            %{expr: expr, op: op}, {_, acc} ->
-              {op, "(" <> acc <> ")" <> operator_to_boolean(op) <> paren_expr(expr, sources, query)}
-          end
-        )
-        |> elem(1)
+        Enum.map_join(query_exprs, " AND ", fn(%QueryExpr{expr: expr}) -> expr(expr, sources, query) end)
       name <> " " <> boolean_expression
     end
     # defp boolean(name, query_exprs, sources, query) do
@@ -584,9 +574,6 @@ if Code.ensure_loaded?(Tds) do
     #         {op, paren_expr(expr, sources, query)}
     #     end)
     # end
-
-    defp operator_to_boolean(:and), do: " AND "
-    defp operator_to_boolean(:or), do: " OR "
 
     defp paren_expr(expr, sources, query) do
       [?(, expr(expr, sources, query), ?)]
