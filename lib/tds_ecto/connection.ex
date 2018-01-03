@@ -208,7 +208,7 @@ if Code.ensure_loaded?(Tds) do
     ## Query
 
     alias Ecto.Query
-    alias Ecto.Query.{SelectExpr, QueryExpr, JoinExpr, BooleanExpr}
+    alias Ecto.Query.{SelectExpr, QueryExpr, JoinExpr}
 
     def all(query) do
       sources = create_names(query)
@@ -252,8 +252,7 @@ if Code.ensure_loaded?(Tds) do
       assemble([delete, from, join, where])
     end
 
-    def insert(prefix, table, header, rows, on_conflict, returning) do
-      [] = on_conflict(on_conflict, header)
+    def insert(prefix, table, header, rows, returning) do
       values =
         if header == [] do
           returning(returning, "INSERTED") <>
@@ -267,22 +266,6 @@ if Code.ensure_loaded?(Tds) do
           "VALUES " <> insert_all(rows, 1, "")
         end
       "INSERT INTO #{quote_table(prefix, table)} " <> values
-    end
-
-    defp on_conflict({_, _, [_ | _]}, _header) do
-      error!(nil, "The :conflict_target option is not supported in insert/insert_all by TDS")
-    end
-    defp on_conflict({:raise, _, []}, _header) do
-      []
-    end
-    defp on_conflict({:nothing, _, []}, [_field | _]) do
-      error!(nil, "The :nothing option is not supported in insert/insert_all by TDS")
-    end
-    defp on_conflict({:replace_all, _, []}, _header) do
-      error!(nil, "The :replace_all option is not supported in insert/insert_all by TDS")
-    end
-    defp on_conflict({_query, _, []}, _header) do
-      error!(nil, "The query as option for on_conflict is not supported in insert/insert_all by TDS yet.")
     end
 
     defp insert_all([row | rows], counter, acc) do
@@ -427,7 +410,7 @@ if Code.ensure_loaded?(Tds) do
     defp from(%{from: from} = query, sources) do
       {from, name} = get_source(query, sources, 0, from)
       "FROM #{from} AS #{name}" <> lock(query.lock)
-      |> String.strip
+      |> String.trim()
     end
 
     defp update_fields(%Query{updates: updates} = query, sources) do
@@ -581,9 +564,9 @@ if Code.ensure_loaded?(Tds) do
           query_exprs,
           {op, paren_expr(expr, sources, query)},
           fn
-            %BooleanExpr{expr: expr, op: op}, {op, acc} ->
+            %{expr: expr, op: op}, {op, acc} ->
               {op, acc <> operator_to_boolean(op) <> paren_expr(expr, sources, query)}
-            %BooleanExpr{expr: expr, op: op}, {_, acc} ->
+            %{expr: expr, op: op}, {_, acc} ->
               {op, "(" <> acc <> ")" <> operator_to_boolean(op) <> paren_expr(expr, sources, query)}
           end
         )
