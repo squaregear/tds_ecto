@@ -1,6 +1,13 @@
-# Tds.Ecto
+# Tds.Ecto (Ecto v2)
 
-MSSQL / TDS Adapter for Ecto
+MSSQL / TDS Adapter for Ecto2
+
+[![Build Status][appveyor-img]][appveyor] [![Hex Version][hex-img]][hex]
+
+[appveyor-img]: https://ci.appveyor.com/api/projects/status/g59ocaellinuig7g?svg=true
+[appveyor]: https://ci.appveyor.com/project/mjaric/tds-ecto-jpd3h
+[hex-img]: https://img.shields.io/hexpm/v/tds_ecto.svg
+[hex]: https://hex.pm/packages/tds_ecto
 
 ## Example
 ```elixir
@@ -23,7 +30,7 @@ defmodule Repo do
 end
 
 defmodule Weather do
-  use Ecto.Model
+  use Ecto.Schema
 
   schema "weather" do
     field :city     # Defaults to type :string
@@ -45,13 +52,27 @@ defmodule Simple do
 end
 ```
 
+Also, if you need to map table to schema other than [dbo], simple use @schema_prefix "your_schema", eg:
+
+```
+defmodule Invoices.Invoice do
+  use Ecto.Schema
+
+  @schema_prefix :invoices
+  schema "invoices" do
+    field :due_date, :datetime
+    field :sum, :float
+  end
+end
+```
+
 ## Usage
 
 Add Tds as a dependency in your `mix.exs` file.
 
 ```elixir
 def deps do
-  [{:tds_ecto, "~> 0.2"}]
+  [{:tds_ecto, "~> 2.0.3"}]
 end
 ```
 
@@ -84,20 +105,21 @@ For additional information on usage please see the documentation for [Ecto](http
 
 ## Data Type Mapping
 
-	MSSQL             	Ecto
-	----------        	------
-	nvarchar          	:string
-	varchar			  	:binary
-	char              	:binary
-	varbinary		  	:binary
-	float             	:float
-	decimal           	:decimal
-	integer 		  	:integer
-	bit 			  	:boolean
-	uniqueidentifier  	:uuid
-	datetime		  	:datetime
-	date			  	:date
-	time 			  	:time
+    MSSQL             	Ecto
+    ----------        	------
+    nvarchar            :string
+    varchar             :binary
+    char                :binary
+    varbinary           :binary
+    float               :float
+    decimal             :decimal
+    integer             :integer
+    bit                 :boolean
+    uniqueidentifier    :uuid
+    datetime            :datetime
+    date                :date
+    time                :time
+
 
 
 ## Contributing
@@ -110,15 +132,13 @@ $ cd tds_ecto
 $ mix test
 ```
 
-The tests require an addition to your hosts file to connect to your sql server database.
+Tests will try to connect to `localhost` using `sa` as username with predefined password `mssql`, but you can set environment variables to override any, like so: `SQL_USERNAME=myuser; SQL_PASSWORD=mypassword; SQL_HOSTNAME=sqlserver.local; mix test` or if you are using windows then `SET SQL_USERNAME=myuser && SET SQL_PASSWORD=mypassword && SET SQL_HOSTNAME=sqlserver.local && mix test`. Please note that tests will run againes default sql server instance.
 
-<IP OF SQL SERVER>	mssql.local
-
-Additionally SQL authentication needs to be used for connecting and testing. Add the user `test_user` with access to the database `test_db`. See one of the test files for the connection information and port number.
+Additionally SQL authentication needs to be used for connecting and testing.If you override default test settings, make sure either that yor user has sysadmin privilegies to add the user `test_user` with access to the database `test_db`, or simply add manualy test_user on your server. See one of the test files for the connection information and port number.
 
 ## License
 
-   Copyright 2014, 2015 LiveHelpNow
+   Copyright 2014, 2015, 2016, 2017 LiveHelpNow
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.

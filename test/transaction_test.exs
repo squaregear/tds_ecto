@@ -3,7 +3,6 @@ defmodule TDS.Ecto.TransactionTest do
   # is the only one access the transactions table
   use ExUnit.Case#, async: true
 
-  import Ecto.Query
   require Ecto.Integration.PoolRepo, as: PoolRepo
 
   defmodule UniqueError do
@@ -16,7 +15,7 @@ defmodule TDS.Ecto.TransactionTest do
   end
 
   defmodule Trans do
-    use Ecto.Model
+    use Ecto.Schema
 
     schema "transactions" do
       field :text, :string

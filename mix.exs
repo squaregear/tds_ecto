@@ -1,14 +1,16 @@
 defmodule TDS.Ecto.Mixfile do
   use Mix.Project
 
+  @version "2.0.6"
+
   def project do
     [
       app: :tds_ecto,
-      version: "1.0.2",
+      version: @version,
       elixir: "~> 1.0",
-      deps: deps,
-      description: description,
-      package: package
+      deps: deps(),
+      description: description(),
+      package: package()
    ]
   end
 
@@ -19,25 +21,26 @@ defmodule TDS.Ecto.Mixfile do
     [applications: [:tds, :ecto]]
   end
 
-  defp deps do
+  defp deps() do
     [
-      #{:ecto, github: "elixir-lang/ecto", tag: "v1.1.1"},
-      {:ecto, "~> 1.1.2"},
-      {:tds, "~> 0.5.4"},
-      #{:tds, path: "../tds"},
-      {:poison, "~> 1.0"}
+      {:ecto, ">= 2.0.0"},
+      {:tds, "~> 1.0"},
+      {:ex_doc, ">= 0.0.0", only: :dev},
+      {:poison, ">= 0.0.0", only: :test}
     ]
   end
 
-  defp description do
+  defp description() do
     """
-    MSSQL / TDS Adapter for Ecto.
+    Ecto 2 Adapter for Microsoft SQL Server
     """
   end
 
   defp package do
-    [maintainers: ["Justin Schneck"],
-     licenses: ["Apache 2.0"],
-     links: %{"Github" => "https://github.com/livehelpnow/tds_ecto"}]
+    [ name: "tds_ecto",
+      files: ["lib", "mix.exs", "README*"],
+      maintainers: ["Justin Schneck", "Eric Witchin", "Milan Jaric"],
+      licenses: ["Apache 2.0"],
+      links: %{"Github" => "https://github.com/livehelpnow/tds_ecto"}]
   end
 end

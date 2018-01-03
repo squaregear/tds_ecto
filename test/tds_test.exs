@@ -2,14 +2,34 @@ Code.require_file "../deps/ecto/integration_test/support/types.exs", __DIR__
 
 defmodule Tds.Ecto.TdsTest do
   use ExUnit.Case, async: true
+  use Ecto.Migration
 
   import Ecto.Query
 
   alias Ecto.Queryable
+  alias Ecto.Integration.TestRepo
+  alias Ecto.Migration.Runner
   alias Tds.Ecto.Connection, as: SQL
 
+  setup meta do
+    config = Application.get_env(:ecto, TestRepo, [])
+    Application.put_env(:ecto, TestRepo, Keyword.merge(config, meta[:repo_config] || []))
+    on_exit fn -> Application.put_env(:ecto, TestRepo, config) end
+  end
+
+  setup meta do
+    direction = meta[:direction] || :forward
+    {:ok, runner} = Runner.start_link(self(), TestRepo, direction, :up, %{level: false, sql: false})
+    Runner.metadata(runner, meta)
+    {:ok, runner: runner}
+  end
+
   defmodule Model do
-    use Ecto.Model
+    use Ecto.Schema
+
+    # import Ecto
+    # import Ecto.Changeset
+    import Ecto.Query
 
     schema "model" do
       field :x, :integer
@@ -27,7 +47,11 @@ defmodule Tds.Ecto.TdsTest do
   end
 
   defmodule Model2 do
-    use Ecto.Model
+    use Ecto.Schema
+
+    # import Ecto
+    # import Ecto.Changeset
+    import Ecto.Query
 
     schema "model2" do
       belongs_to :post, Tds.Ecto.TdsTest.Model,
@@ -37,16 +61,26 @@ defmodule Tds.Ecto.TdsTest do
   end
 
   defmodule Model3 do
-    use Ecto.Model
+    use Ecto.Schema
 
+    # import Ecto
+    # import Ecto.Changeset
+    import Ecto.Query
+
+    @schema_prefix "foo"
     schema "model3" do
       field :binary, :binary
     end
   end
 
-  defp normalize(query, operation \\ :all) do
-    {query, _params, _key} = Ecto.Query.Planner.prepare(query, operation, Tds.Ecto)
-    Ecto.Query.Planner.normalize(query, operation, Tds.Ecto)
+  defp normalize(query, operation \\ :all, counter \\ 0) do
+    {query, _params, _key} = Ecto.Query.Planner.prepare(query, operation, Tds.Ecto, counter)
+    case Ecto.Query.Planner.normalize(query, operation, Tds.Ecto, counter) do
+      # ecto >= 2.2.+
+      {query, _} -> query
+      # ecto < 2.2.0
+      query -> query
+    end
   end
 
   test "from" do
@@ -54,18 +88,43 @@ defmodule Tds.Ecto.TdsTest do
     assert SQL.all(query) == ~s{SELECT m0.[x] FROM [model] AS m0}
   end
 
-  test "from without model" do
-    query = "posts" |> select([r], r.x) |> normalize
-    assert SQL.all(query) == ~s{SELECT p0.[x] FROM [posts] AS p0}
+  test "from Model3 with schema foo" do
+    query = Model3 |> select([r], r.binary) |> normalize
+    assert SQL.all(query) == ~s{SELECT m0.[binary] FROM [foo].[model3] AS m0}
+  end
 
-    assert_raise Ecto.QueryError, ~r"MSSQL requires a model", fn ->
-      SQL.all from(p in "posts", select: p) |> normalize()
+  test "from without model" do
+    query = "model" |> select([r], r.x) |> normalize
+    assert SQL.all(query) == ~s{SELECT m0.[x] FROM [model] AS m0}
+    
+    # todo: somthing is changed into ecto causing this exception to be missed.
+    # instead query is built as "SELECT &(0) FROM [posts] AS p0" which won't work
+    assert_raise Ecto.QueryError, ~r"TDS Adapter does not support selecting all fields from", fn ->
+      query = from(p in "posts", select: [p]) |> normalize()
+      SQL.all(query)
+      |> IO.inspect()
     end
   end
-  # test "from with schema source" do
-  #   query = "public.posts" |> select([r], r.x) |> normalize
-  #   assert SQL.all(query) == ~s{SELECT p0.[x] FROM [public].[posts] AS p0}
-  # end
+
+  test "from with schema source" do
+    query = "public.posts" |> select([r], r.x) |> normalize
+    assert SQL.all(query) == ~s{SELECT p0.[x] FROM [public].[posts] AS p0}
+  end
+  
+  test "from with schema source, linked database" do
+    query = "externaldb.public.posts" |> select([r], r.x) |> normalize
+    assert_raise ArgumentError, ~r"TDS addapter do not support query of external database or linked server table", fn ->
+      SQL.all(query)
+    end
+  end
+
+  test "subquery" do
+    query = subquery("posts" |> select([r], %{x: r.x, y: r.y})) |> select([r], r.x) |> normalize
+    assert SQL.all(query) == ~s{SELECT s0.[x] FROM (SELECT p0.[x] AS [x], p0.[y] AS [y] FROM [posts] AS p0) AS s0}
+
+    query = subquery("posts" |> select([r], %{x: r.x, z: r.y})) |> select([r], r) |> normalize
+    assert SQL.all(query) == ~s{SELECT s0.[x], s0.[z] FROM (SELECT p0.[x] AS [x], p0.[y] AS [z] FROM [posts] AS p0) AS s0}
+  end
 
   test "select" do
     query = Model |> select([r], {r.x, r.y}) |> normalize
@@ -118,10 +177,12 @@ defmodule Tds.Ecto.TdsTest do
     assert SQL.all(query) == ~s{SELECT TOP(3) 0 FROM [model] AS m0}
 
     query = Model |> order_by([r], r.x) |> offset([r], 5) |> select([], 0) |> normalize
-    assert SQL.all(query) == ~s{SELECT 0 FROM [model] AS m0 ORDER BY m0.[x] OFFSET 5 ROW}
+    assert_raise Ecto.QueryError, fn ->
+      SQL.all(query)
+    end
 
     query = Model |> order_by([r], r.x) |> offset([r], 5) |> limit([r], 3) |> select([], 0) |> normalize
-    assert SQL.all(query) == ~s{SELECT TOP(3) 0 FROM [model] AS m0 ORDER BY m0.[x] OFFSET 5 ROW}
+    assert SQL.all(query) == ~s{SELECT 0 FROM [model] AS m0 ORDER BY m0.[x] OFFSET 5 ROW FETCH NEXT 3 ROWS ONLY}
 
     query = Model |> offset([r], 5) |> limit([r], 3) |> select([], 0) |> normalize
     assert_raise Ecto.QueryError, fn ->
@@ -134,15 +195,13 @@ defmodule Tds.Ecto.TdsTest do
     assert SQL.all(query) == ~s{SELECT 0 FROM [model] AS m0 WITH(NOLOCK)}
   end
 
-  # TODO
-  # These need to be updated
-  # test "string escape" do
-  #   query = Model |> select([], "'\\  ") |> normalize
-  #   assert SQL.all(query) == ~s{SELECT '''\\\\  ' FROM [model] AS m0}
+  test "string escape" do
+    query = Model |> select([], "'\\  ") |> normalize
+    assert SQL.all(query) == ~s{SELECT CONVERT(nvarchar(4), 0x27005c0020002000) FROM [model] AS m0}
 
-  #   query = Model |> select([], "'") |> normalize
-  #   assert SQL.all(query) == ~s{SELECT '''' FROM [model] AS m0}
-  # end
+    query = Model |> select([], "'") |> normalize
+    assert SQL.all(query) == ~s{SELECT '''' FROM [model] AS m0}
+  end
 
   test "binary ops" do
     query = Model |> select([r], r.x == 2) |> normalize
@@ -173,17 +232,19 @@ defmodule Tds.Ecto.TdsTest do
   end
 
   test "fragments" do
-    query = Model |> select([r], fragment("lower(?)", r.x)) |> normalize
+    query = Model
+      |> select([r], fragment("lower(?)", r.x))
+      |> normalize
     assert SQL.all(query) == ~s{SELECT lower(m0.[x]) FROM [model] AS m0}
 
     value = 13
     query = Model |> select([r], fragment("lower(?)", ^value)) |> normalize
     assert SQL.all(query) == ~s{SELECT lower(@1) FROM [model] AS m0}
 
-    # query = Model |> select([], fragment(title: 2)) |> normalize
-    # assert_raise ArgumentError, fn ->
-    #   SQL.all(query)
-    # end
+    query = Model |> select([], fragment(title: 2)) |> normalize
+    assert_raise Ecto.QueryError, ~r"TDS adapter does not support keyword or interpolated fragments", fn ->
+      SQL.all(query)
+    end
   end
 
   test "literals" do
@@ -196,8 +257,8 @@ defmodule Tds.Ecto.TdsTest do
     query = Model |> select([], false) |> normalize
     assert SQL.all(query) == ~s{SELECT 0 FROM [model] AS m0}
 
-    # query = Model |> select([], "abc") |> normalize
-    # assert SQL.all(query) == ~s{SELECT 'abc' FROM [model] AS m0}
+    query = Model |> select([], "abc") |> normalize
+    assert SQL.all(query) == ~s{SELECT 'abc' FROM [model] AS m0}
 
     query = Model |> select([], 123) |> normalize
     assert SQL.all(query) == ~s{SELECT 123 FROM [model] AS m0}
@@ -206,10 +267,10 @@ defmodule Tds.Ecto.TdsTest do
     assert SQL.all(query) == ~s{SELECT 123.0 FROM [model] AS m0}
   end
 
-  # test "tagged type" do
-  #   query = Model |> select([], type(^"601d74e4-a8d3-4b6e-8365-eddb4c893327", Ecto.UUID)) |> normalize
-  #   assert SQL.all(query) == ~s{SELECT CAST(? AS uniqueidentifier) FROM [model] AS m0}
-  # end
+  test "tagged type" do
+    query = Model |> select([], type(^"601d74e4-a8d3-4b6e-8365-eddb4c893327", Ecto.UUID)) |> normalize
+    assert SQL.all(query) == ~s{SELECT CAST(@1 AS uniqueidentifier) FROM [model] AS m0}
+  end
 
   test "nested expressions" do
     z = 123
@@ -225,6 +286,8 @@ defmodule Tds.Ecto.TdsTest do
     assert SQL.all(query) == ~s{SELECT 1 IN (1,m0.[x],3) FROM [model] AS m0}
 
     query = Model |> select([e], 1 in ^[]) |> normalize
+    # SelectExpr fields in Ecto v1 == [{:in, [], [1, []]}]
+    # SelectExpr fields in Ecto v2 == [{:in, [], [1, {:^, [], [0, 0]}]}]
     assert SQL.all(query) == ~s{SELECT 0=1 FROM [model] AS m0}
 
     query = Model |> select([e], 1 in ^[1, 2, 3]) |> normalize
@@ -232,6 +295,17 @@ defmodule Tds.Ecto.TdsTest do
 
     query = Model |> select([e], 1 in [1, ^2, 3]) |> normalize
     assert SQL.all(query) == ~s{SELECT 1 IN (1,@1,3) FROM [model] AS m0}
+  end
+
+  test "in expression with multiple where conditions" do
+    xs = [1, 2, 3]
+    y = 4
+    query = Model 
+      |> where([m], m.x in ^xs) 
+      |> where([m], m.y == ^y) 
+      |> select([m], m.x) 
+      
+    assert SQL.all(query |> normalize) == ~s{SELECT m0.[x] FROM [model] AS m0 WHERE (m0.[x] IN (@1,@2,@3)) AND (m0.[y] = @4)}
   end
 
   test "having" do
@@ -252,6 +326,9 @@ defmodule Tds.Ecto.TdsTest do
     query = Model |> group_by([r], 2) |> select([r], r.x) |> normalize
     assert SQL.all(query) == ~s{SELECT m0.[x] FROM [model] AS m0 GROUP BY 2}
 
+    query = Model3 |> group_by([r], 2) |> select([r], r.binary) |> normalize
+    assert SQL.all(query) == ~s{SELECT m0.[binary] FROM [foo].[model3] AS m0 GROUP BY 2}
+
     query = Model |> group_by([r], [r.x, r.y]) |> select([r], r.x) |> normalize
     assert SQL.all(query) == ~s{SELECT m0.[x] FROM [model] AS m0 GROUP BY m0.[x], m0.[y]}
 
@@ -261,15 +338,15 @@ defmodule Tds.Ecto.TdsTest do
 
   test "interpolated values" do
     query = Model
-            |> select([], ^0)
-            |> join(:inner, [], Model2, ^true)
-            |> join(:inner, [], Model2, ^false)
-            |> where([], ^true)
-            |> where([], ^false)
-            |> group_by([], ^1)
-            |> group_by([], ^2)
-            |> having([], ^true)
-            |> having([], ^false)
+            |> select([m], {m.id, ^0})
+            |> join(:inner, [], Model3, fragment("?", ^true))
+            |> join(:inner, [], Model3, fragment("?", ^false))
+            |> where([], fragment("?", ^true))
+            |> where([], fragment("?", ^false))
+            |> having([], fragment("?", ^true))
+            |> having([], fragment("?", ^false))
+            |> group_by([], fragment("?", ^1))
+            |> group_by([], fragment("?", ^2))
             |> order_by([], fragment("?", ^3))
             |> order_by([], ^:x)
             |> limit([], ^4)
@@ -277,15 +354,15 @@ defmodule Tds.Ecto.TdsTest do
             |> normalize
 
     result =
-      "SELECT TOP(@11) @1 FROM [model] AS m0 INNER JOIN [model2] AS m1 ON @2 " <>
-      "INNER JOIN [model2] AS m2 ON @3 WHERE (@4) AND (@5) " <>
+      "SELECT m0.[id], @1 FROM [model] AS m0 INNER JOIN [foo].[model3] AS m1 ON @2 " <>
+      "INNER JOIN [foo].[model3] AS m2 ON @3 WHERE (@4) AND (@5) " <>
       "GROUP BY @6, @7 HAVING (@8) AND (@9) " <>
-      "ORDER BY @10, m0.[x] OFFSET @12 ROW"
+      "ORDER BY @10, m0.[x] OFFSET @12 ROW FETCH NEXT @11 ROWS ONLY"
 
     assert SQL.all(query) == String.rstrip(result)
   end
 
-  ## *_all
+  # ## *_all
 
   test "update all" do
     query = from(m in Model, update: [set: [x: 0]]) |> normalize(:update_all)
@@ -303,7 +380,7 @@ defmodule Tds.Ecto.TdsTest do
     # TODO:
     # nvarchar(max) conversion
 
-    query = from(m in Model, update: [set: [x: 0, y: "123"]]) |> normalize(:update_all)
+    query = from(m in Model, update: [set: [x: 0, y: 123]]) |> normalize(:update_all)
     assert SQL.update_all(query) ==
            ~s{UPDATE m0 SET m0.[x] = 0, m0.[y] = 123 FROM [model] AS m0}
 
@@ -354,7 +431,7 @@ defmodule Tds.Ecto.TdsTest do
   end
 
 
-  ## Joins
+  # ## Joins
 
   test "join" do
     query = Model |> join(:inner, [p], q in Model2, p.x == q.z) |> select([], 0) |> normalize
@@ -415,7 +492,7 @@ defmodule Tds.Ecto.TdsTest do
   test "association join has_one" do
     query = Model |> join(:inner, [p], pp in assoc(p, :permalink)) |> select([], 0) |> normalize
     assert SQL.all(query) ==
-           "SELECT 0 FROM [model] AS m0 INNER JOIN [model3] AS m1 ON m1.[id] = m0.[y]"
+           "SELECT 0 FROM [model] AS m0 INNER JOIN [foo].[model3] AS m1 ON m1.[id] = m0.[y]"
   end
 
   test "join produces correct bindings" do
@@ -426,19 +503,19 @@ defmodule Tds.Ecto.TdsTest do
            "SELECT m0.[id], m2.[id] FROM [model] AS m0 INNER JOIN [model2] AS m1 ON 1 INNER JOIN [model2] AS m2 ON 1"
   end
 
-  # Model based
+  # # Model based
 
   test "insert" do
-    query = SQL.insert(nil, "model", [:x, :y], [])
+    query = SQL.insert(nil, "model", [:x, :y], [[:x, :y]], {:raise, [], []}, [])
     assert query == ~s{INSERT INTO [model] ([x], [y]) VALUES (@1, @2)}
 
-    query = SQL.insert(nil, "model", [], [:id])
-    assert query == ~s{INSERT INTO [model] OUTPUT INSERTED.[id] DEFAULT VALUES}
+    query = SQL.insert(nil, "model", [:x, :y], [[:x, :y], [nil, :y]], {:raise, [], []}, [])
+    assert query == ~s{INSERT INTO [model] ([x], [y]) VALUES (@1, @2),(DEFAULT, @3)}
 
-    query = SQL.insert(nil, "model", [], [])
+    query = SQL.insert(nil, "model", [], [[]], {:raise, [], []}, [])
     assert query == ~s{INSERT INTO [model] DEFAULT VALUES}
 
-    query = SQL.insert("prefix", "model", [], [])
+    query = SQL.insert("prefix", "model", [], [[]], {:raise, [], []}, [])
     assert query == ~s{INSERT INTO [prefix].[model] DEFAULT VALUES}
   end
 
@@ -464,21 +541,21 @@ defmodule Tds.Ecto.TdsTest do
     assert query == ~s{DELETE FROM [prefix].[model] WHERE [x] = @1 AND [y] = @2}
   end
 
-  # DDL
+  # # DDL
 
   import Ecto.Migration, only: [table: 1, table: 2, index: 2, index: 3, references: 1, references: 2]
 
   test "executing a string during migration" do
-    assert SQL.execute_ddl("example") == "example"
+    assert SQL.execute_ddl("example") ==  ["example"]
   end
 
   test "create table" do
     create = {:create, table(:posts),
-               [{:add, :id, :serial, [primary_key: true]},
+               [{:add, :id, :bigserial, [primary_key: true]},
                 {:add, :title, :string, []},
                 {:add, :created_at, :datetime, []}]}
     assert SQL.execute_ddl(create) ==
-           ~s|CREATE TABLE [posts] ([id] bigint NOT NULL PRIMARY KEY IDENTITY, [title] nvarchar(255) NULL, [created_at] datetime2 NULL)|
+           ~s|CREATE TABLE [posts] ([id] bigint IDENTITY(1,1), [title] nvarchar(255), [created_at] datetime, CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([id]))|
   end
 
   test "create table with prefix" do
@@ -488,52 +565,84 @@ defmodule Tds.Ecto.TdsTest do
                 {:add, :on_hand, :integer, [default: 0, null: true]},
                 {:add, :is_active, :boolean, [default: true]}]}
 
-    assert SQL.execute_ddl(create) == """
-    CREATE TABLE [foo].[posts] ([name] nvarchar(20) NOT NULL CONSTRAINT DF_name DEFAULT N'Untitled',
-    [price] numeric(8,2) NULL CONSTRAINT DF_price DEFAULT expr,
-    [on_hand] integer NULL CONSTRAINT DF_on_hand DEFAULT 0,
-    [is_active] bit NULL CONSTRAINT DF_is_active DEFAULT 1)
-    """ |> remove_newlines
+    assert SQL.execute_ddl(create) == [ 
+    "CREATE TABLE [foo].[posts] (",
+      "[name] nvarchar(20) NOT NULL CONSTRAINT [DF_foo_posts_name] DEFAULT (N'Untitled'), ",
+      "[price] numeric(8,2) CONSTRAINT [DF_foo_posts_price] DEFAULT (expr), ",
+      "[on_hand] integer NULL CONSTRAINT [DF_foo_posts_on_hand] DEFAULT (0), ",
+      "[is_active] bit CONSTRAINT [DF_foo_posts_is_active] DEFAULT (1)",
+    ")"
+    ] |> IO.iodata_to_binary
   end
 
   test "create table with reference" do
     create = {:create, table(:posts),
                [{:add, :id, :serial, [primary_key: true]},
                 {:add, :category_id, references(:categories), []} ]}
-    assert SQL.execute_ddl(create) ==
-           ~s|CREATE TABLE [posts] ([id] bigint NOT NULL PRIMARY KEY IDENTITY, [category_id] bigint NULL CONSTRAINT [posts_category_id_fkey] FOREIGN KEY (category_id) REFERENCES [categories]([id]))|
+    assert SQL.execute_ddl(create) == [ 
+      "CREATE TABLE [posts] ([id] int IDENTITY(1,1), [category_id] BIGINT, ",
+      "CONSTRAINT [FK__posts_category_id] FOREIGN KEY ([category_id]) ",
+      "REFERENCES [categories]([id]), CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([id]))" 
+      ] |> IO.iodata_to_binary
+
+  end
+
+  test "create table with composite key" do
+		create = {:create, table(:posts),
+                 [{:add, :a, :integer, [primary_key: true]},
+                  {:add, :b, :integer, [primary_key: true]},
+                  {:add, :name, :string, []}]}
+
+      assert SQL.execute_ddl(create) == [
+      "CREATE TABLE [posts] ([a] integer, [b] integer, [name] nvarchar(255), ",
+      "CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([a], [b]))"
+      ] |> IO.iodata_to_binary
   end
 
   test "create table with named reference" do
     create = {:create, table(:posts),
                [{:add, :id, :serial, [primary_key: true]},
                 {:add, :category_id, references(:categories, name: :foo_bar), []} ]}
-    assert SQL.execute_ddl(create) ==
-           ~s|CREATE TABLE [posts] ([id] bigint NOT NULL PRIMARY KEY IDENTITY, [category_id] bigint NULL CONSTRAINT [foo_bar] FOREIGN KEY (category_id) REFERENCES [categories]([id]))|
+    assert SQL.execute_ddl(create) == [
+      "CREATE TABLE [posts] ([id] int IDENTITY(1,1), [category_id] BIGINT, ",
+      "CONSTRAINT [foo_bar] FOREIGN KEY ([category_id]) REFERENCES [categories]([id]), ",
+      "CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([id]))"
+    ] |> IO.iodata_to_binary
   end
 
   test "create table with reference and on_delete: :nothing clause" do
     create = {:create, table(:posts),
-               [{:add, :id, :serial, [primary_key: true]},
+               [{:add, :id, :bigserial, [primary_key: true]},
                 {:add, :category_id, references(:categories, on_delete: :nothing), []} ]}
-    assert SQL.execute_ddl(create) ==
-           ~s|CREATE TABLE [posts] ([id] bigint NOT NULL PRIMARY KEY IDENTITY, [category_id] bigint NULL CONSTRAINT [posts_category_id_fkey] FOREIGN KEY (category_id) REFERENCES [categories]([id]))|
+    assert SQL.execute_ddl(create) == [
+      "CREATE TABLE [posts] ([id] bigint IDENTITY(1,1), [category_id] BIGINT, ",
+      "CONSTRAINT [FK__posts_category_id] FOREIGN KEY ([category_id]) ",
+      "REFERENCES [categories]([id]), CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([id]))"
+    ] |> IO.iodata_to_binary
   end
 
   test "create table with reference and on_delete: :nilify_all clause" do
     create = {:create, table(:posts),
                [{:add, :id, :serial, [primary_key: true]},
                 {:add, :category_id, references(:categories, on_delete: :nilify_all), []} ]}
-    assert SQL.execute_ddl(create) ==
-           ~s|CREATE TABLE [posts] ([id] bigint NOT NULL PRIMARY KEY IDENTITY, [category_id] bigint NULL CONSTRAINT [posts_category_id_fkey] FOREIGN KEY (category_id) REFERENCES [categories]([id]) ON DELETE SET NULL)|
+    assert SQL.execute_ddl(create) == [
+      "CREATE TABLE [posts] ([id] int IDENTITY(1,1), [category_id] BIGINT, ",
+      "CONSTRAINT [FK__posts_category_id] FOREIGN KEY ([category_id]) ",
+      "REFERENCES [categories]([id]) ON DELETE SET NULL, ",
+      "CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([id]))"] |> IO.iodata_to_binary
   end
 
   test "create table with reference and on_delete: :delete_all clause" do
     create = {:create, table(:posts),
                [{:add, :id, :serial, [primary_key: true]},
                 {:add, :category_id, references(:categories, on_delete: :delete_all), []} ]}
-    assert SQL.execute_ddl(create) ==
-           ~s|CREATE TABLE [posts] ([id] bigint NOT NULL PRIMARY KEY IDENTITY, [category_id] bigint NULL CONSTRAINT [posts_category_id_fkey] FOREIGN KEY (category_id) REFERENCES [categories]([id]) ON DELETE CASCADE)|  end
+    assert SQL.execute_ddl(create) == [
+      "CREATE TABLE [posts] ([id] int IDENTITY(1,1), [category_id] BIGINT, ",
+      "CONSTRAINT [FK__posts_category_id] FOREIGN KEY ([category_id]) ",
+      "REFERENCES [categories]([id]) ON DELETE CASCADE, ",
+      "CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([id]))"
+    ] |> IO.iodata_to_binary
+  end
 
   test "create table with column options" do
     create = {:create, table(:posts),
@@ -542,16 +651,14 @@ defmodule Tds.Ecto.TdsTest do
                 {:add, :on_hand, :integer, [default: 0, null: true]},
                 {:add, :is_active, :boolean, [default: true]}]}
 
-    assert SQL.execute_ddl(create) == """
-    CREATE TABLE [posts] ([name] nvarchar(20) NOT NULL
-    CONSTRAINT DF_name DEFAULT N'Untitled',
-    [price] numeric(8,2) NULL
-    CONSTRAINT DF_price DEFAULT expr,
-    [on_hand] integer NULL
-    CONSTRAINT DF_on_hand DEFAULT 0,
-    [is_active] bit NULL
-    CONSTRAINT DF_is_active DEFAULT 1)
-    """ |> remove_newlines
+    assert SQL.execute_ddl(create) == [
+      "CREATE TABLE [posts] (",
+        "[name] nvarchar(20) NOT NULL CONSTRAINT [DF__posts_name] DEFAULT (N'Untitled'), ",
+        "[price] numeric(8,2) CONSTRAINT [DF__posts_price] DEFAULT (expr), ",
+        "[on_hand] integer NULL CONSTRAINT [DF__posts_on_hand] DEFAULT (0), ",
+        "[is_active] bit CONSTRAINT [DF__posts_is_active] DEFAULT (1)",
+      ")"
+    ] |> IO.iodata_to_binary
   end
 
   test "drop table" do
@@ -570,90 +677,62 @@ defmodule Tds.Ecto.TdsTest do
                 {:modify, :price, :numeric, [precision: 8, scale: 2]},
                 {:remove, :summary}]}
 
-    assert SQL.execute_ddl(alter) == """
-    ALTER TABLE [posts] ADD [title] nvarchar(100) NOT NULL ;
-    IF (OBJECT_ID('DF_title', 'D') IS NOT NULL)
-    BEGIN
-    ALTER TABLE [posts] DROP CONSTRAINT DF_title
-    END;
-    ALTER TABLE [posts] ADD CONSTRAINT DF_title DEFAULT N'Untitled' FOR [title];
-    ALTER TABLE [posts] ALTER COLUMN [price] numeric(8,2) NULL ;
-    IF (OBJECT_ID('DF_price', 'D') IS NOT NULL)
-    BEGIN
-    ALTER TABLE [posts] DROP CONSTRAINT DF_price
-    END;
-    ALTER TABLE [posts] DROP COLUMN [summary]
-    """ |> remove_newlines
+    assert SQL.execute_ddl(alter) == [
+      "ALTER TABLE [posts] ADD [title] nvarchar(100) NOT NULL CONSTRAINT [DF__posts_title] DEFAULT (N'Untitled');",
+      "ALTER TABLE [posts] ALTER COLUMN [price] numeric(8,2);",
+      "ALTER TABLE [posts] DROP COLUMN [summary];"
+    ] 
+      |> Enum.map(&"#{&1} ")
+      |> IO.iodata_to_binary
   end
 
   test "alter table with prefix" do
     alter = {:alter, table(:posts, prefix: :foo),
-               [{:add, :title, :string, [default: "Untitled", size: 100, null: false]},
-                {:add, :author_id, references(:author), []},
-                {:modify, :price, :numeric, [precision: 8, scale: 2, null: true]},
-                {:modify, :cost, :integer, [null: false, default: nil]},
-                {:modify, :permalink_id, references(:permalinks, prefix: :foo), null: false},
-                {:remove, :summary}]}
+             [{:add, :title, :string, [default: "Untitled", size: 100, null: false]},
+              {:add, :author_id, references(:author), []},
+              {:modify, :price, :numeric, [precision: 8, scale: 2, null: true]},
+              {:modify, :cost, :integer, [null: true, default: nil]},
+              {:modify, :permalink_id, references(:permalinks, prefix: :foo), null: false},
+              {:remove, :summary}]}
 
-    assert SQL.execute_ddl(alter) == """
-    ALTER TABLE [foo].[posts] ADD [title] nvarchar(100) NOT NULL ;
-    IF (OBJECT_ID('DF_title', 'D') IS NOT NULL)
-    BEGIN ALTER TABLE [posts]
-    DROP CONSTRAINT DF_title END;
-    ALTER TABLE [posts] ADD CONSTRAINT DF_title DEFAULT N'Untitled' FOR [title];
-    ALTER TABLE [foo].[posts] ADD [author_id] bigint NULL
-    CONSTRAINT [posts_author_id_fkey] FOREIGN KEY (author_id)
-    REFERENCES [author]([id]) ;
-    IF (OBJECT_ID('DF_author_id', 'D') IS NOT NULL)
-    BEGIN ALTER TABLE [posts] DROP CONSTRAINT DF_author_id END;
-    ALTER TABLE [foo].[posts] ALTER COLUMN [price] numeric(8,2) NULL ;
-    IF (OBJECT_ID('DF_price', 'D') IS NOT NULL)
-    BEGIN ALTER TABLE [posts] DROP CONSTRAINT DF_price END;
-    ALTER TABLE [foo].[posts] ALTER COLUMN [cost] integer NOT NULL ;
-    IF (OBJECT_ID('DF_cost', 'D') IS NOT NULL)
-    BEGIN ALTER TABLE [posts] DROP CONSTRAINT DF_cost END;
-    ALTER TABLE [posts] ADD CONSTRAINT DF_cost DEFAULT NULL FOR [cost];
-    ALTER TABLE [foo].[posts] ALTER COLUMN [permalink_id] bigint NOT NULL ;
-    IF (OBJECT_ID('[posts_permalink_id_fkey]', 'F') IS NOT NULL) BEGIN
-    ALTER TABLE [posts] DROP CONSTRAINT [posts_permalink_id_fkey] END;
-    ALTER TABLE [posts] ADD CONSTRAINT [posts_permalink_id_fkey] FOREIGN KEY ([permalink_id])
-    REFERENCES [permalinks]([id]) ;
-    IF (OBJECT_ID('DF_permalink_id', 'D') IS NOT NULL)
-    BEGIN ALTER TABLE [posts] DROP CONSTRAINT DF_permalink_id END;
-    ALTER TABLE [foo].[posts] DROP COLUMN [summary]
-    """ |> remove_newlines
+    expected_ddl = [
+      "ALTER TABLE [foo].[posts] ADD [title] nvarchar(100) NOT NULL CONSTRAINT [DF_foo_posts_title] DEFAULT (N'Untitled'); ",
+      "ALTER TABLE [foo].[posts] ADD [author_id] BIGINT; ",
+      "ALTER TABLE [foo].[posts] ADD CONSTRAINT [FK_foo_posts_author_id] FOREIGN KEY ([author_id]) REFERENCES [foo].[author]([id]); ",
+      "ALTER TABLE [foo].[posts] ALTER COLUMN [price] numeric(8,2) NULL; ",
+      "IF (OBJECT_ID(N'[DF_foo_posts_cost]', 'DF') IS NOT NULL) BEGIN ALTER TABLE [foo].[posts] DROP CONSTRAINT [DF_foo_posts_cost];  END; ",
+      "ALTER TABLE [foo].[posts] ALTER COLUMN [cost] integer NULL; ",
+      "ALTER TABLE [foo].[posts] ADD CONSTRAINT [DF_foo_posts_cost] DEFAULT (NULL) FOR [cost]; ",
+      "IF (OBJECT_ID(N'[FK_foo_posts_permalink_id]', 'F') IS NOT NULL) BEGIN ALTER TABLE [foo].[posts] DROP CONSTRAINT [FK_foo_posts_permalink_id];  END; ",
+      "ALTER TABLE [foo].[posts] ALTER COLUMN [permalink_id] BIGINT NOT NULL; ",
+      "ALTER TABLE [foo].[posts] ADD CONSTRAINT [FK_foo_posts_permalink_id] FOREIGN KEY ([permalink_id]) REFERENCES [foo].[permalinks]([id]); ",
+      "ALTER TABLE [foo].[posts] DROP COLUMN [summary]; "
+    ] |> IO.iodata_to_binary
+
+    assert SQL.execute_ddl(alter)  == expected_ddl
   end
 
   test "alter table with reference" do
     alter = {:alter, table(:posts),
                [{:add, :comment_id, references(:comments), []}]}
 
-    assert SQL.execute_ddl(alter) == """
-    ALTER TABLE [posts] ADD [comment_id] bigint NULL CONSTRAINT [posts_comment_id_fkey] FOREIGN KEY (comment_id) REFERENCES [comments]([id]) ;
-    IF (OBJECT_ID('DF_comment_id', 'D') IS NOT NULL)
-    BEGIN
-    ALTER TABLE [posts] DROP CONSTRAINT DF_comment_id
-    END
-    """ |> remove_newlines
+    assert SQL.execute_ddl(alter) == [
+      "ALTER TABLE [posts] ADD [comment_id] BIGINT; ",
+      "ALTER TABLE [posts] ADD CONSTRAINT [FK__posts_comment_id] FOREIGN KEY ([comment_id]) REFERENCES [comments]([id]); "]
+      |> IO.iodata_to_binary
+
   end
 
   test "alter table with adding foreign key constraint" do
     alter = {:alter, table(:posts),
-              [{:modify, :user_id, references(:users, on_delete: :delete_all), []}]
+              [{:modify, :user_id, references(:users, on_delete: :delete_all, type: :bigserial), []}]
             }
 
-    assert SQL.execute_ddl(alter) == """
-    ALTER TABLE [posts] ALTER COLUMN [user_id] bigint NULL ;
-    IF (OBJECT_ID('[posts_user_id_fkey]', 'F') IS NOT NULL)
-    BEGIN
-    ALTER TABLE [posts] DROP CONSTRAINT [posts_user_id_fkey]
-    END;
-    ALTER TABLE [posts] ADD CONSTRAINT [posts_user_id_fkey] FOREIGN KEY ([user_id]) REFERENCES [users]([id]) ON DELETE CASCADE ;
-    IF (OBJECT_ID('DF_user_id', 'D') IS NOT NULL)
-    BEGIN
-    ALTER TABLE [posts] DROP CONSTRAINT DF_user_id
-    END
-    """ |> remove_newlines
+    assert SQL.execute_ddl(alter) == [
+      "IF (OBJECT_ID(N'[FK__posts_user_id]', 'F') IS NOT NULL) BEGIN ALTER TABLE [posts] DROP CONSTRAINT [FK__posts_user_id];  END; ",
+      "ALTER TABLE [posts] ALTER COLUMN [user_id] BIGINT; ",
+      "ALTER TABLE [posts] ADD CONSTRAINT [FK__posts_user_id] FOREIGN KEY ([user_id]) REFERENCES [users]([id]) ON DELETE CASCADE; "
+    ] |> IO.iodata_to_binary()
   end
 
   test "create table with options" do
@@ -661,7 +740,7 @@ defmodule Tds.Ecto.TdsTest do
                [{:add, :id, :serial, [primary_key: true]},
                 {:add, :created_at, :datetime, []}]}
     assert SQL.execute_ddl(create) ==
-           ~s|CREATE TABLE [posts] ([id] bigint NOT NULL PRIMARY KEY IDENTITY, [created_at] datetime2 NULL) WITH FOO=BAR|
+           ~s|CREATE TABLE [posts] ([id] int IDENTITY(1,1), [created_at] datetime, CONSTRAINT [PK__posts] PRIMARY KEY CLUSTERED ([id])) WITH FOO=BAR|
   end
 
   test "rename table" do
@@ -684,59 +763,84 @@ defmodule Tds.Ecto.TdsTest do
     assert SQL.execute_ddl(rename) == ~s|EXEC sp_rename 'foo.posts.given_name', 'first_name', 'COLUMN'|
   end
 
-  # test "create index" do
-  #   create = {:create, index(:posts, [:category_id, :permalink])}
-  #   assert SQL.execute_ddl(create) ==
-  #          ~s|CREATE INDEX [posts_category_id_permalink_index] ON [posts] ([category_id], [permalink])|
+  test "create index" do
+    create = {:create, index(:posts, [:category_id, :permalink])}
+    assert SQL.execute_ddl(create) ==
+           ~s|CREATE INDEX [posts_category_id_permalink_index] ON [posts] ([category_id], [permalink]);|
 
-  #   create = {:create, index(:posts, ["lower(permalink)"], name: "posts$main")}
-  #   assert SQL.execute_ddl(create) ==
-  #          ~s|CREATE INDEX [posts$main] ON [posts] ([lower(permalink)])|
-  # end
+    # below should be handled with collation on column which is indexed 
+
+    # create = {:create, index(:posts, ["lower(permalink)"], name: "posts$main")}
+    # assert SQL.execute_ddl(create) ==
+    #        ~s|CREATE INDEX [posts$main] ON [posts] ([lower(permalink)])|
+
+    create = {:create, index(:posts, ["[category_id] ASC", "[permalink] DESC"], name: "IX_posts_by_category")}
+    assert SQL.execute_ddl(create) ==
+      ~s|CREATE INDEX [IX_posts_by_category] ON [posts] ([category_id] ASC, [permalink] DESC);|
+  end
 
   test "create index with prefix" do
     create = {:create, index(:posts, [:category_id, :permalink], prefix: :foo)}
     assert SQL.execute_ddl(create) ==
-           ~s|CREATE INDEX [posts_category_id_permalink_index]  ON  [foo].[posts]  (category_id, permalink)|
+           ~s|CREATE INDEX [posts_category_id_permalink_index] ON [foo].[posts] ([category_id], [permalink]);|
   end
 
-  # test "create index asserting concurrency" do
-  #   create = {:create, index(:posts, ["lower(permalink)"], name: "posts$main", concurrently: true)}
-  #   assert SQL.execute_ddl(create) ==
-  #          ~s|CREATE INDEX `posts$main` ON `posts` (`lower(permalink)`) LOCK=NONE|
-  # end
+  test "create index with prefix if not exists" do
+    create = {:create_if_not_exists, index(:posts, [:category_id, :permalink], prefix: :foo)}
+    assert SQL.execute_ddl(create) ==
+      ["IF NOT EXISTS (SELECT name FROM sys.indexes ", 
+       "WHERE name = N'posts_category_id_permalink_index' ",
+       "AND object_id = OBJECT_ID(N'foo.posts')) ",
+       "CREATE INDEX [posts_category_id_permalink_index] ON [foo].[posts] ([category_id], [permalink]);"]
+       |> IO.iodata_to_binary()
+  end
 
-  # test "create unique index" do
-  #   create = {:create, index(:posts, [:permalink], unique: true)}
-  #   assert SQL.execute_ddl(create) ==
-  #          ~s|CREATE UNIQUE INDEX `posts_permalink_index` ON `posts` (`permalink`)|
-  # end
+  test "create index asserting concurrency" do
+    create = {:create, index(:posts, [:permalink], name: "posts$main", concurrently: true)}
+    assert SQL.execute_ddl(create) ==
+           ~s|CREATE INDEX [posts$main] ON [posts] ([permalink]) LOCK=NONE;|
+  end
 
-  # test "create an index using a different type" do
-  #   create = {:create, index(:posts, [:permalink], using: :hash)}
-  #   assert SQL.execute_ddl(create) ==
-  #          ~s|CREATE INDEX `posts_permalink_index` ON `posts` (`permalink`) USING hash|
-  # end
+  test "create unique index" do
+    create = {:create, index(:posts, [:permalink], unique: true)}
+    assert SQL.execute_ddl(create) ==
+           ~s|CREATE UNIQUE INDEX [posts_permalink_index] ON [posts] ([permalink]);|
+    create = {:create, index(:posts, [:permalink], unique: true, prefix: :foo)}
+    assert SQL.execute_ddl(create) ==
+           ~s|CREATE UNIQUE INDEX [posts_permalink_index] ON [foo].[posts] ([permalink]);|
+  end
 
-  # test "drop index" do
-  #   drop = {:drop, index(:posts, [:id], name: "posts$main")}
-  #   assert SQL.execute_ddl(drop) == ~s|DROP INDEX `posts$main` ON `posts`|
-  # end
+  test "create an index using a different type" do
+    create = {:create, index(:posts, [:permalink], using: :hash)}
+    assert_raise ArgumentError, ~r"TDS adapter does not support using in indexes.", fn ->
+      SQL.execute_ddl(create)
+    end
+  end
+
+  test "drop index" do
+    drop = {:drop, index(:posts, [:id], name: "posts$main")}
+    assert SQL.execute_ddl(drop) == ~s|DROP INDEX [posts$main] ON [posts];|
+  end
 
   test "drop index with prefix" do
     drop = {:drop, index(:posts, [:id], name: "posts_category_id_permalink_index", prefix: :foo)}
-    assert SQL.execute_ddl(drop) == ~s|DROP INDEX [posts_category_id_permalink_index]  ON  [foo].[posts]|
+    assert SQL.execute_ddl(drop) == ~s|DROP INDEX [posts_category_id_permalink_index] ON [foo].[posts];|
   end
 
-  # test "drop index asserting concurrency" do
-  #   drop = {:drop, index(:posts, [:id], name: "posts$main", concurrentlyrently: true)}
-  #   assert SQL.execute_ddl(drop) == ~s|DROP INDEX `posts$main` ON `posts` LOCK=NONE|
-  # end
+  test "drop index with prefix if exists" do
+    drop = {:drop_if_exists, index(:posts, [:id], name: "posts_category_id_permalink_index", prefix: :foo)}
+    assert SQL.execute_ddl(drop) == 
+      ["IF EXISTS (SELECT name FROM sys.indexes ", 
+       "WHERE name = N'posts_category_id_permalink_index' ",
+       "AND object_id = OBJECT_ID(N'foo.posts')) ",
+       "DROP INDEX [posts_category_id_permalink_index] ON [foo].[posts];"] 
+       |> IO.iodata_to_binary()
+  end
 
 
-
-  defp remove_newlines(string) do
-    string |> String.strip |> String.replace("\n", " ")
+  test "drop index asserting concurrency" do
+    drop = {:drop, index(:posts, [:id], name: "posts$main", concurrently: true)}
+    assert SQL.execute_ddl(drop) == ~s|DROP INDEX [posts$main] ON [posts] LOCK=NONE;|
   end
 
 end

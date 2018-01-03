@@ -1,3 +1,18 @@
+# v2.0.3 (v2.0.2)
+* Fixing failed test when schemaless query is executed without specified columns in projection
+
+# v1.0.6 (v1.0.2)
+* Integrated upstream changes
+* Add default expression to alter tables too.
+
+# v1.0.4 (v1.0.2)
+* Integrated upstream changes
+
+# v1.0.3
+* Bug fixes
+  * Rollbacks for columns with defaults is now working.
+  * Forwards for columns with defaults is now working.
+
 # v1.0.2
 * Bug Fixes
   * fixed limit
