@@ -252,6 +252,10 @@ if Code.ensure_loaded?(Tds) do
       assemble([delete, from, join, where])
     end
 
+    def insert(prefix, table, header, rows, _on_conflict, returning) do
+      insert(prefix, table, header, rows, returning)
+    end
+
     def insert(prefix, table, header, rows, returning) do
       values =
         if header == [] do
@@ -560,7 +564,9 @@ if Code.ensure_loaded?(Tds) do
     defp boolean(_name, [], _sources, _query), do: []
     defp boolean(name, query_exprs, sources, query) do
       boolean_expression =
-        Enum.map_join(query_exprs, " AND ", fn(%QueryExpr{expr: expr}) -> expr(expr, sources, query) end)
+        Enum.map_join(query_exprs, " AND ", fn(%QueryExpr{expr: expr}) -> expr(expr, sources, query)
+          (%Ecto.Query.BooleanExpr{expr: expr}) -> expr(expr, sources, query)
+        end)
       name <> " " <> boolean_expression
     end
     # defp boolean(name, query_exprs, sources, query) do
